@@ -18,16 +18,16 @@ It produces
 	python -m venv .venv
 	source .venv/bin/activate               # on Windows: .venv\Scripts\activate
 
-# install dependencies
+# Install dependencies
 	pip install numpy pandas matplotlib
 
-# run with defaults (100 nodes, 60 epochs) – plots + CSVs
+# Run with defaults (100 nodes, 60 epochs) – plots + CSVs
 	python adhoc_time_sync_sim.py
 
-# show node IDs on the topology plot
+# Show node IDs on the topology plot
 	python adhoc_time_sync_sim.py --show-ids
 
-#Command-line options
+# Command-line options
 
 	--nodes N            number of nodes (default: 100)
 	--epochs E           number of epochs (default: 60)
@@ -45,7 +45,7 @@ It produces
 	--no-cad             disable CAD (beacon multiplier fixed at 1)
 
 
-# compare overheads by disabling countermeasures
+# Compare overheads by disabling countermeasures
 
 	python adhoc_time_sync_sim.py --no-auth --no-consistency --no-rtt --no-cad
 
@@ -75,8 +75,7 @@ Cost model:
     CPU energy from verify/sign/fusion/RTT processing.
 
 
-
-Outputs
+# Outputs
 
 After a run you’ll get:
 
@@ -110,7 +109,7 @@ How to read the key graphs
     Degree (number of 1-hop neighbors) on X. More neighbors → more RX verifies, fusion work, and often higher TX, so these trends usually slope upward.
 
 
-Configuration (edit in code)
+# Configuration (edit in code)
 
 All tunables live in SimConfig at the top of adhoc_time_sync_sim.py:
 
