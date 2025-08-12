@@ -3,7 +3,7 @@ Simulation code for the Defending Every Tick: Comprehensive Attack Mitigation an
 
 This repo contains a single-file Python simulator for a 100-node ad-hoc time-sync network. It measures the overhead (bytes, airtime, CPU time, energy) of enabling a minimal bundle of countermeasures that, together, defend against the full attack surface discussed in the paper.
 
-It produces:
+It produces
 
     1- A topology plot of the random geometric graph (RGG)
 
@@ -14,7 +14,7 @@ It produces:
 
     4- CSV artifacts (summary.csv, per_node.csv) for analysis
 
-    # (optional) create and activate a virtual env
+# (optional) create and activate a virtual env
 python -m venv .venv
 source .venv/bin/activate               # on Windows: .venv\Scripts\activate
 
