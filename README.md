@@ -28,14 +28,14 @@ python adhoc_time_sync_sim.py
 python adhoc_time_sync_sim.py --show-ids
 
 #Command-line options
---nodes N            number of nodes (default: 100)
---epochs E           number of epochs (default: 60)
---range R            radio range in meters (default: 120)
---loss P             baseline packet loss probability [0..1] (default: 0.02)
---seed S             RNG seed (default: 42)
-
---show-ids           annotate node IDs on the topology plot
---no-topology        skip topology plotting
+    --nodes N            number of nodes (default: 100)
+    --epochs E           number of epochs (default: 60)
+    --range R            radio range in meters (default: 120)
+    --loss P             baseline packet loss probability [0..1] (default: 0.02)
+    --seed S             RNG seed (default: 42)
+    
+    --show-ids           annotate node IDs on the topology plot
+    --no-topology        skip topology plotting
 
 # Countermeasure toggles
 --no-auth            disable authenticated messaging + replay protection
