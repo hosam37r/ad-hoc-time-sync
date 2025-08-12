@@ -5,14 +5,14 @@ This repo contains a single-file Python simulator for a 100-node ad-hoc time-syn
 
 It produces:
 
-    A topology plot of the random geometric graph (RGG)
+    1- A topology plot of the random geometric graph (RGG)
 
-    An energy histogram and a convergence curve
+    2- An energy histogram and a convergence curve
 
-    Three degree–resource scatter plots
+    3- Three degree–resource scatter plots
     (neighbors vs total energy / CPU time / CPU energy)
 
-    CSV artifacts (summary.csv, per_node.csv) for analysis
+    4- CSV artifacts (summary.csv, per_node.csv) for analysis
 
     # (optional) create and activate a virtual env
 python -m venv .venv
