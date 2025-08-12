@@ -5,54 +5,55 @@ This repo contains a single-file Python simulator for a 100-node ad-hoc time-syn
 
 It produces
 
-    1- A topology plot of the random geometric graph (RGG)
+1- A topology plot of the random geometric graph (RGG)
 
-    2- An energy histogram and a convergence curve
+2- An energy histogram and a convergence curve
 
-    3- Three degree–resource scatter plots
+3- Three degree–resource scatter plots
     (neighbors vs total energy / CPU time / CPU energy)
 
-    4- CSV artifacts (summary.csv, per_node.csv) for analysis
+4- CSV artifacts (summary.csv, per_node.csv) for analysis
 
 # (optional) create and activate a virtual env
-python -m venv .venv
-source .venv/bin/activate               # on Windows: .venv\Scripts\activate
+	python -m venv .venv
+	source .venv/bin/activate               # on Windows: .venv\Scripts\activate
 
 # install dependencies
-pip install numpy pandas matplotlib
+	pip install numpy pandas matplotlib
 
 # run with defaults (100 nodes, 60 epochs) – plots + CSVs
-python adhoc_time_sync_sim.py
+	python adhoc_time_sync_sim.py
 
 # show node IDs on the topology plot
-python adhoc_time_sync_sim.py --show-ids
+	python adhoc_time_sync_sim.py --show-ids
 
 #Command-line options
-    --nodes N            number of nodes (default: 100)
-    --epochs E           number of epochs (default: 60)
-    --range R            radio range in meters (default: 120)
-    --loss P             baseline packet loss probability [0..1] (default: 0.02)
-    --seed S             RNG seed (default: 42)
+
+	--nodes N            number of nodes (default: 100)
+	--epochs E           number of epochs (default: 60)
+	--range R            radio range in meters (default: 120)
+	--loss P             baseline packet loss probability [0..1] (default: 0.02)
+	--seed S             RNG seed (default: 42)
     
     --show-ids           annotate node IDs on the topology plot
     --no-topology        skip topology plotting
 
 # Countermeasure toggles
---no-auth            disable authenticated messaging + replay protection
---no-consistency     disable neighbor consistency & majority voting
---no-rtt             disable RTT wormhole/delay checks
---no-cad             disable CAD (beacon multiplier fixed at 1)
+	--no-auth            disable authenticated messaging + replay protection
+	--no-consistency     disable neighbor consistency & majority voting
+	--no-rtt             disable RTT wormhole/delay checks
+	--no-cad             disable CAD (beacon multiplier fixed at 1)
 
 
 # compare overheads by disabling countermeasures
 
-python adhoc_time_sync_sim.py --no-auth --no-consistency --no-rtt --no-cad
+	python adhoc_time_sync_sim.py --no-auth --no-consistency --no-rtt --no-cad
 
 What the simulator does
 
-    Topology: Builds an RGG in a square field; nodes are neighbors if distance ≤ radio_range. Rare isolated nodes are “healed” by linking to their nearest neighbor.
+Topology: Builds an RGG in a square field; nodes are neighbors if distance ≤ radio_range. Rare isolated nodes are “healed” by linking to their nearest neighbor.
 
-    Per-epoch sync loop:
+Per-epoch sync loop:
 
         Authenticated beacons + replay protection (modeled bytes + CPU)
         (toggle: --no-auth)
@@ -69,7 +70,7 @@ What the simulator does
         Tracks loss in a sliding window, increases beaconing up to 3× under loss
         (toggle: --no-cad)
 
-    Cost model:
+Cost model:
     Radio energy = electronics/bit + amplifier·distance²;
     CPU energy from verify/sign/fusion/RTT processing.
 
@@ -123,10 +124,11 @@ All tunables live in SimConfig at the top of adhoc_time_sync_sim.py:
 
     RTT probing rate
 Examples:
-# heavier loss
-python adhoc_time_sync_sim.py --loss 0.05
-# larger network / different connectivity
-python adhoc_time_sync_sim.py --nodes 200 --range 100
+	
+	# heavier loss
+	python adhoc_time_sync_sim.py --loss 0.05
+	# larger network / different connectivity
+	python adhoc_time_sync_sim.py --nodes 200 --range 100
 
 
 
