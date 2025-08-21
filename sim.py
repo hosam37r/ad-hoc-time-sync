@@ -1,29 +1,57 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ad-hoc time synchronization network simulator (extensively commented + 3 extra plots)
+Ad-hoc time synchronization network simulator with Suite profiles (A–E),
+continuous curve-based comparisons (no scatter points), per-suite message
+overhead (broadcast + unicast), and overhead message accounting/plots.
 
-NEW PLOTS
----------
-1) Degree (neighbors) vs TOTAL energy used (mJ)  -> "power consumed" proxy
-2) Degree (neighbors) vs CPU time (s)            -> "calculation time"
-3) Degree (neighbors) vs CPU energy used (mJ)    -> "processing power used" proxy
+WHAT'S NEW (matches paper criteria)
+-----------------------------------
+• Per-suite message overhead:
+    - message_overhead_bcast_bytes: extra bytes added to EVERY beacon
+    - message_overhead_uni_bytes:   extra bytes added to EVERY unicast RTT msg
+• Overhead messages definition & tracking:
+    - Overhead beacons := CAD-added beacons beyond baseline 1/epoch/node
+    - Overhead unicast := ALL RTT challenge/response messages
+    - Per-node + per-suite counters and CSV columns
+• New plots:
+    - degree_vs_overhead_msgs_curve.png        (single suite)
+    - compare_degree_vs_overhead_msgs.png      (overlay across suites)
+• Compare-suites default runs A–D (fair security floor); E optional via --suites.
 
-WHAT'S MODELED
---------------
-Topology: Random Geometric Graph (RGG) in a square field; neighbors within radio_range.
-Time sync per epoch:
-  (1) Authenticated beacons (+µTESLA-like overhead)  [toggle: --no-auth]
-  (2) Neighbor consistency (median + MAD outlier rejection) [--no-consistency]
-  (3) RTT challenge/response checks (wormhole/delay proxy)  [--no-rtt]
-  (4) Channel-Aware Detection (CAD) adapts beacon rate with loss [--no-cad]
+RUN EXAMPLES
+------------
+# Single suite (A)
+python3 sim.py --profile suite-a
+
+# Compare A–D (default)
+python3 sim.py --compare-suites
+
+# Compare a chosen set (include E if desired)
+python3 sim.py --compare-suites --suites suite-a,suite-b,suite-c,suite-d,suite-e
+
+# Global overrides for measured per-suite overheads (bytes)
+python3 sim.py --compare-suites --msg-overhead-bcast 6 --msg-overhead-uni 3
+
+# Customize size / range / loss / epochs
+python3 sim.py --compare-suites --nodes 150 --range 100 --loss 0.05 --epochs 80
 
 OUTPUTS
 -------
-- topology.png
-- summary.csv, per_node.csv
-- plots: energy histogram, convergence curve
-- NEW: degree_vs_energy.png, degree_vs_cpu_time.png, degree_vs_cpu_energy.png
+- Topology (drawn once for first suite): topology_<suite>.png
+- Per-suite CSVs: summary_<suite>.csv, per_node_<suite>.csv
+- Per-suite figures:
+    energy histogram, convergence curve
+    degree_vs_energy_curve.png
+    degree_vs_cpu_time_curve.png
+    degree_vs_cpu_energy_curve.png
+    degree_vs_overhead_msgs_curve.png   <-- NEW
+- Overlay comparison plots (all suites):
+    compare_convergence.png
+    compare_degree_vs_energy.png
+    compare_degree_vs_cpu_time.png
+    compare_degree_vs_cpu_energy.png
+    compare_degree_vs_overhead_msgs.png <-- NEW
 
 Dependencies: numpy, pandas, matplotlib
 """
@@ -33,7 +61,7 @@ from __future__ import annotations
 import argparse
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -65,6 +93,14 @@ class SimConfig:
     mac_tag_bytes: int = 8
     tesla_key_overhead_bytes: int = 8
 
+    # Suite extras (beacons)
+    extra_beacon_bytes: int = 0          # e.g., identity metadata
+    phy_extra_bytes: int = 0             # PHY integrity/ranging metadata
+
+    # NEW: suite-specific message overhead (measured/estimated)
+    message_overhead_bcast_bytes: int = 0   # added to EVERY beacon
+    message_overhead_uni_bytes: int = 0     # added to EVERY RTT unicast
+
     # Packet sizing (RTT)
     rtt_payload_bytes: int = 12
 
@@ -81,6 +117,12 @@ class SimConfig:
     neighbor_fusion_time_s_per_sample: float = 0.00005
     rtt_proc_time_s: float = 0.00015
 
+    # EXTRAS for profiles (per-message/per-sample CPU costs)
+    phy_check_time_s: float = 0.0        # extra CPU for PHY integrity/ranging (TX and RX)
+    identity_cpu_per_sample_s: float = 0.0  # NISA/PASID-like profiling per offset sample
+    trust_cpu_per_msg_s: float = 0.0     # trust validation (RX/TX sides)
+    tspm_cpu_per_msg_s: float = 0.0      # TSPM-like vetting (RX)
+
     # Radio energy model
     e_elec_j_per_bit: float = 50e-9
     e_amp_j_per_bit_m2: float = 100e-12
@@ -96,6 +138,9 @@ class SimConfig:
     enable_consistency: bool = True
     enable_rtt: bool = True
     enable_cad: bool = True
+
+    # Fusion behavior
+    correction_gain: float = 0.5  # how aggressively to apply median correction (0..1)
 
 
 # =============================================================================
@@ -125,6 +170,12 @@ class Node:
         self.rx_msgs = 0
         self.cpu_time_s = 0.0
         self.radio_time_s = 0.0
+
+        # Overhead-specific accounting (per node)
+        self.beacons_sent_total = 0            # all beacons this node transmitted
+        self.beacons_overhead_sent = 0         # CAD-added beacons beyond baseline 1/epoch
+        self.rtt_msgs_sent = 0                 # all RTT unicast TX (challenge + response)
+        self.overhead_bytes_sent = 0           # (bcast_overhead_bytes + unicast_overhead_bytes)
 
         # Minimal replay/auth state
         self.seq_out = 0
@@ -214,12 +265,17 @@ class Network:
         bytes_total = self.cfg.base_packet_bytes + self.cfg.header_bytes
         if self.cfg.enable_auth:
             bytes_total += self.cfg.mac_tag_bytes + self.cfg.tesla_key_overhead_bytes
+        # Suite extras + measured per-suite overhead
+        bytes_total += self.cfg.extra_beacon_bytes + self.cfg.phy_extra_bytes
+        bytes_total += self.cfg.message_overhead_bcast_bytes
         return bytes_total * 8
 
     def unicast_size_bits(self) -> int:
         bytes_total = self.cfg.rtt_payload_bytes + self.cfg.header_bytes
         if self.cfg.enable_auth:
             bytes_total += self.cfg.mac_tag_bytes
+        # Measured per-suite overhead
+        bytes_total += self.cfg.message_overhead_uni_bytes
         return bytes_total * 8
 
     # ---- Simulation loop ----
@@ -243,7 +299,7 @@ class Network:
                     n.cad_window_rx_expected = []
                     n.cad_window_rx_ok = []
 
-            # Convergence proxy
+            # Convergence proxy (median absolute residual to network median)
             residuals = [node.local_time(t) - self.nodes[0].local_time(t) for node in self.nodes]
             residuals = np.array(residuals) - np.median(residuals)
             epoch_err_median.append(float(np.median(np.abs(residuals))))
@@ -252,16 +308,30 @@ class Network:
     # ---- Epoch steps ----
     def _epoch_broadcasts(self, epoch: int, t: float) -> None:
         bits = self.broadcast_size_bits()
+        bcast_overhead_bytes = self.cfg.message_overhead_bcast_bytes
+
         for tx in self.nodes:
             n_beacons = max(1, min(tx.beacon_multiplier, self.cfg.cad_max_multiplier))
             max_distance = self.cfg.radio_range
+
+            # Count total beacons and CAD overhead beacons
+            tx.beacons_sent_total += n_beacons
+            if n_beacons > 1:
+                tx.beacons_overhead_sent += (n_beacons - 1)
+
+            # Transmit n_beacons
             for _ in range(n_beacons):
                 tx.tx_msgs += 1
                 tx.tx_bytes += bits // 8
                 tx.spend_radio_tx(bits, max_distance)
+                if bcast_overhead_bytes > 0:
+                    tx.overhead_bytes_sent += bcast_overhead_bytes
                 if self.cfg.enable_auth:
                     tx.spend_cpu(self.cfg.sign_time_s)
+                if self.cfg.phy_check_time_s > 0.0:
+                    tx.spend_cpu(self.cfg.phy_check_time_s)  # TX-side PHY integrity
 
+            # Deliver to neighbors
             for nbr_id in tx.neighbors:
                 rx = self.nodes[nbr_id]
 
@@ -283,17 +353,27 @@ class Network:
                     rx.spend_radio_rx(bits)
                     if self.cfg.enable_auth:
                         rx.spend_cpu(self.cfg.verify_time_s)
-                        # Simple replay state (overhead model)
+                    if self.cfg.phy_check_time_s > 0.0:
+                        rx.spend_cpu(self.cfg.phy_check_time_s)  # RX-side PHY check
+                    if self.cfg.trust_cpu_per_msg_s > 0.0:
+                        rx.spend_cpu(self.cfg.trust_cpu_per_msg_s)
+                    if self.cfg.tspm_cpu_per_msg_s > 0.0:
+                        rx.spend_cpu(self.cfg.tspm_cpu_per_msg_s)
+
+                    # Simple replay state (overhead model)
+                    if self.cfg.enable_auth:
                         tx.seq_out += 1
                         seq = tx.seq_out
                         prev = rx.seq_in_max.get(tx.nid, -1)
                         if seq > prev:
                             rx.seq_in_max[tx.nid] = seq
 
-                    # Time-offset sample for fusion
+                    # Time-offset sample for fusion + identity profiling overhead if any
                     neighbor_time = tx.local_time(t)
                     my_time = rx.local_time(t)
                     rx.recent_offsets.append(neighbor_time - my_time)
+                    if self.cfg.identity_cpu_per_sample_s > 0.0:
+                        rx.spend_cpu(self.cfg.identity_cpu_per_sample_s)
                     if len(rx.recent_offsets) > 50:
                         rx.recent_offsets = rx.recent_offsets[-50:]
 
@@ -313,7 +393,7 @@ class Network:
                 node.recent_offsets = []
                 continue
             node.spend_cpu(self.cfg.neighbor_fusion_time_s_per_sample * len(samples))
-            correction = float(np.median(kept)) * 0.5
+            correction = float(np.median(kept)) * self.cfg.correction_gain
             node.update_offset(correction)
             node.recent_offsets = []
 
@@ -322,6 +402,8 @@ class Network:
         if n_checks == 0:
             return
         bits = self.unicast_size_bits()
+        uni_overhead_bytes = self.cfg.message_overhead_uni_bytes
+
         selected = np.random.choice(range(self.cfg.n_nodes), size=n_checks, replace=False)
         for nid in selected:
             a = self.nodes[nid]
@@ -335,8 +417,13 @@ class Network:
             a.tx_msgs += 1
             a.tx_bytes += bits // 8
             a.spend_radio_tx(bits, d)
+            a.rtt_msgs_sent += 1
+            if uni_overhead_bytes > 0:
+                a.overhead_bytes_sent += uni_overhead_bytes
             if self.cfg.enable_auth:
                 a.spend_cpu(self.cfg.sign_time_s)
+            if self.cfg.trust_cpu_per_msg_s > 0.0:
+                a.spend_cpu(self.cfg.trust_cpu_per_msg_s)
 
             if np.random.rand() >= self.cfg.base_packet_loss:
                 # B receives
@@ -345,13 +432,20 @@ class Network:
                 b.spend_radio_rx(bits)
                 if self.cfg.enable_auth:
                     b.spend_cpu(self.cfg.verify_time_s)
+                if self.cfg.trust_cpu_per_msg_s > 0.0:
+                    b.spend_cpu(self.cfg.trust_cpu_per_msg_s)
 
                 # B -> A response
                 b.tx_msgs += 1
                 b.tx_bytes += bits // 8
                 b.spend_radio_tx(bits, d)
+                b.rtt_msgs_sent += 1
+                if uni_overhead_bytes > 0:
+                    b.overhead_bytes_sent += uni_overhead_bytes
                 if self.cfg.enable_auth:
                     b.spend_cpu(self.cfg.sign_time_s)
+                if self.cfg.trust_cpu_per_msg_s > 0.0:
+                    b.spend_cpu(self.cfg.trust_cpu_per_msg_s)
 
                 if np.random.rand() >= self.cfg.base_packet_loss:
                     a.rx_msgs += 1
@@ -360,6 +454,8 @@ class Network:
                     if self.cfg.enable_auth:
                         a.spend_cpu(self.cfg.verify_time_s)
                     a.spend_cpu(self.cfg.rtt_proc_time_s)
+                    if self.cfg.trust_cpu_per_msg_s > 0.0:
+                        a.spend_cpu(self.cfg.trust_cpu_per_msg_s)
 
     def _epoch_cad_update(self, epoch: int) -> None:
         if (epoch + 1) % self.cfg.cad_window != 0:
@@ -383,6 +479,16 @@ class Network:
         total_rx_msgs = sum(n.rx_msgs for n in self.nodes)
         cpu_time_total_s = sum(n.cpu_time_s for n in self.nodes)
         radio_time_total_s = sum(n.radio_time_s for n in self.nodes)
+
+        # Overhead message counts
+        total_beacons_sent = sum(n.beacons_sent_total for n in self.nodes)
+        baseline_beacons = self.cfg.n_nodes * self.cfg.epochs  # 1 beacon/epoch/node baseline
+        total_overhead_beacons = max(0, total_beacons_sent - baseline_beacons)
+        total_rtt_msgs = sum(n.rtt_msgs_sent for n in self.nodes)
+        total_overhead_msgs = total_overhead_beacons + total_rtt_msgs
+
+        # Overhead bytes (just the overhead fields, not full packet bytes)
+        total_overhead_bytes = sum(n.overhead_bytes_sent for n in self.nodes)
 
         cpu_energy_mj = sum((self.cfg.mcu_power_mw * 1e-3) * n.cpu_time_s * 1000.0 for n in self.nodes)
         battery_remaining_mj = sum(n.battery_mj for n in self.nodes)
@@ -408,10 +514,20 @@ class Network:
             ("enable_consistency", self.cfg.enable_consistency),
             ("enable_rtt", self.cfg.enable_rtt),
             ("enable_cad", self.cfg.enable_cad),
+            ("extra_beacon_bytes", self.cfg.extra_beacon_bytes),
+            ("phy_extra_bytes", self.cfg.phy_extra_bytes),
+            ("msg_overhead_bcast_bytes", self.cfg.message_overhead_bcast_bytes),
+            ("msg_overhead_uni_bytes", self.cfg.message_overhead_uni_bytes),
+            ("correction_gain", self.cfg.correction_gain),
+            ("rtt_checks_frac", self.cfg.rtt_checks_per_epoch_frac),
             ("total_tx_msgs", total_tx_msgs),
             ("total_rx_msgs", total_rx_msgs),
             ("total_tx_bytes", total_tx_bytes),
             ("total_rx_bytes", total_rx_bytes),
+            ("total_overhead_beacons", total_overhead_beacons),
+            ("total_rtt_msgs", total_rtt_msgs),
+            ("total_overhead_msgs", total_overhead_msgs),
+            ("total_overhead_bytes", total_overhead_bytes),
             ("total_energy_used_mJ", round(total_energy_used_mj, 2)),
             ("cpu_energy_mJ", round(cpu_energy_mj, 2)),
             ("radio_energy_mJ", round(radio_energy_mj, 2)),
@@ -437,7 +553,13 @@ class Network:
                 "cpu_time_s": round(n.cpu_time_s, 6),
                 "radio_time_s": round(n.radio_time_s, 6),
                 "battery_remaining_mJ": round(n.battery_mj, 2),
-                "beacon_multiplier_final": n.beacon_multiplier
+                "beacon_multiplier_final": n.beacon_multiplier,
+                # NEW overhead per-node
+                "beacons_sent_total": n.beacons_sent_total,
+                "beacons_overhead_sent": n.beacons_overhead_sent,
+                "rtt_msgs_sent": n.rtt_msgs_sent,
+                "overhead_msgs_sent": n.beacons_overhead_sent + n.rtt_msgs_sent,
+                "overhead_bytes_sent": n.overhead_bytes_sent,
             })
         per_node_df = pd.DataFrame(per_node_rows)
 
@@ -472,12 +594,198 @@ def plot_topology(net: Network, annotate: bool = False, filename: Optional[str] 
     plt.show()
 
 
+# ---- CONTINUOUS CURVE HELPERS (per-degree mean + dense interpolation) ----
+def _per_degree_mean(df: pd.DataFrame, ycol: str):
+    g = df.groupby("degree", as_index=False)[ycol].mean().sort_values("degree")
+    x = g["degree"].values.astype(float)
+    y = g[ycol].values.astype(float)
+    return x, y
+
+def _dense_interp(x: np.ndarray, y: np.ndarray, points: int = 400):
+    if x.size == 0:
+        return np.array([]), np.array([])
+    if x.size == 1:
+        # Single degree present: flat line
+        xd = np.linspace(x[0], x[0] + 1e-6, points)
+        yd = np.full_like(xd, y[0])
+        return xd, yd
+    xd = np.linspace(x.min(), x.max(), points)
+    yd = np.interp(xd, x, y)
+    return xd, yd
+
+def plot_degree_curve(df: pd.DataFrame, ycol: str, title: str, ylabel: str, outfile: Optional[str] = None):
+    x, y = _per_degree_mean(df, ycol)
+    xd, yd = _dense_interp(x, y, points=500)
+    plt.figure(figsize=(7, 4))
+    plt.plot(xd, yd, linewidth=2)  # continuous line, no markers
+    plt.title(title)
+    plt.xlabel("Number of Neighbors (Degree)")
+    plt.ylabel(ylabel)
+    plt.tight_layout()
+    if outfile:
+        plt.savefig(outfile, dpi=200)
+    plt.show()
+
+def overlay_compare_degree_curves(all_data: Dict[str, pd.DataFrame], ycol: str, title: str, ylabel: str, outfile: str):
+    plt.figure(figsize=(8, 5))
+    for label, df in all_data.items():
+        x, y = _per_degree_mean(df, ycol)
+        xd, yd = _dense_interp(x, y, points=500)
+        plt.plot(xd, yd, linewidth=2, label=label.upper())
+    plt.title(title)
+    plt.xlabel("Number of Neighbors (Degree)")
+    plt.ylabel(ylabel)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(outfile, dpi=220)
+    plt.show()
+
+def overlay_compare_curves(all_residuals: Dict[str, List[float]], title: str, outfile: str) -> None:
+    plt.figure(figsize=(8, 5))
+    for label, curve in all_residuals.items():
+        plt.plot(range(len(curve)), curve, label=label.upper())
+    plt.title(title)
+    plt.xlabel("Epoch")
+    plt.ylabel("Median Absolute Residual Offset (s)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(outfile, dpi=220)
+    plt.show()
+
+
+# =============================================================================
+# Profiles (Suites) — configuration presets
+# =============================================================================
+
+def make_profile_cfg(base: SimConfig, profile: str) -> SimConfig:
+    """Return a copy of base cfg customized for the given profile (suite-a..e)."""
+    cfg = SimConfig(**vars(base))  # shallow copy via dataclass kwargs
+    p = profile.lower()
+
+    if p == "suite-a":
+        # Software-only baseline
+        cfg.enable_auth = True
+        cfg.enable_consistency = True
+        cfg.enable_rtt = True
+        cfg.enable_cad = True
+        cfg.rtt_checks_per_epoch_frac = 0.2
+        cfg.extra_beacon_bytes = 0
+        cfg.phy_extra_bytes = 0
+        cfg.phy_check_time_s = 0.0
+        cfg.identity_cpu_per_sample_s = 0.0
+        cfg.trust_cpu_per_msg_s = 0.0
+        cfg.tspm_cpu_per_msg_s = 0.0
+        cfg.correction_gain = 0.5
+        # Per-suite message overhead (defaults; override via CLI if needed)
+        cfg.message_overhead_bcast_bytes = 0
+        cfg.message_overhead_uni_bytes = 0
+
+    elif p == "suite-b":
+        # PHY-hardened: replace RTT with PHY integrity/ranging
+        cfg.enable_auth = True
+        cfg.enable_consistency = True
+        cfg.enable_rtt = False
+        cfg.enable_cad = True
+        cfg.rtt_checks_per_epoch_frac = 0.0
+        cfg.phy_extra_bytes = 12
+        cfg.phy_check_time_s = 0.00015
+        cfg.extra_beacon_bytes = 0
+        cfg.identity_cpu_per_sample_s = 0.0
+        cfg.trust_cpu_per_msg_s = 0.0
+        cfg.tspm_cpu_per_msg_s = 0.0
+        cfg.correction_gain = 0.5
+        cfg.message_overhead_bcast_bytes = 4
+        cfg.message_overhead_uni_bytes = 4
+
+    elif p == "suite-c":
+        # Identity-aware (NISA/PASID-like)
+        cfg.enable_auth = True
+        cfg.enable_consistency = True
+        cfg.enable_rtt = True
+        cfg.enable_cad = True
+        cfg.rtt_checks_per_epoch_frac = 0.2
+        cfg.extra_beacon_bytes = 6
+        cfg.identity_cpu_per_sample_s = 0.00005
+        cfg.phy_extra_bytes = 0
+        cfg.phy_check_time_s = 0.0
+        cfg.trust_cpu_per_msg_s = 0.0
+        cfg.tspm_cpu_per_msg_s = 0.0
+        cfg.correction_gain = 0.5
+        cfg.message_overhead_bcast_bytes = 4
+        cfg.message_overhead_uni_bytes = 2
+
+    elif p == "suite-d":
+        # Self-stabilizing & trust-validated: no CAD, lower gain
+        cfg.enable_auth = True
+        cfg.enable_consistency = True
+        cfg.enable_rtt = True
+        cfg.enable_cad = False
+        cfg.rtt_checks_per_epoch_frac = 0.2
+        cfg.extra_beacon_bytes = 0
+        cfg.phy_extra_bytes = 0
+        cfg.phy_check_time_s = 0.0
+        cfg.identity_cpu_per_sample_s = 0.0
+        cfg.trust_cpu_per_msg_s = 0.00010
+        cfg.tspm_cpu_per_msg_s = 0.0
+        cfg.correction_gain = 0.3
+        cfg.message_overhead_bcast_bytes = 2
+        cfg.message_overhead_uni_bytes = 6
+
+    elif p == "suite-e":
+        # Lightweight / energy-savvy (optional for ablation)
+        cfg.enable_auth = True
+        cfg.enable_consistency = True
+        cfg.enable_rtt = True
+        cfg.enable_cad = False
+        cfg.rtt_checks_per_epoch_frac = 0.05
+        cfg.extra_beacon_bytes = 0
+        cfg.phy_extra_bytes = 0
+        cfg.phy_check_time_s = 0.0
+        cfg.identity_cpu_per_sample_s = 0.0
+        cfg.trust_cpu_per_msg_s = 0.0
+        cfg.tspm_cpu_per_msg_s = 0.00005
+        cfg.correction_gain = 0.5
+        cfg.message_overhead_bcast_bytes = 0
+        cfg.message_overhead_uni_bytes = 0
+
+    else:
+        raise ValueError(f"Unknown profile: {profile}")
+
+    return cfg
+
+
+# =============================================================================
+# Run helpers
+# =============================================================================
+
+def run_profile(base_cfg: SimConfig, profile: str, show_topology: bool=False):
+    """Build and run one profile; return label, network, summary, per_node, residuals."""
+    # Reset RNG so topology positions are identical across suites (fair comparison)
+    np.random.seed(base_cfg.seed)
+    random.seed(base_cfg.seed)
+    cfg = make_profile_cfg(base_cfg, profile)
+    net = Network(cfg)
+    if show_topology:
+        plot_topology(net, annotate=False, filename=f"topology_{profile}.png")
+    summary_df, per_node_df, residuals = net.run()
+
+    # Enhance per-node with derived metrics
+    per_node_df["energy_used_mJ"] = cfg.battery_mj - per_node_df["battery_remaining_mJ"]
+    per_node_df["cpu_energy_mJ"] = (cfg.mcu_power_mw * 1e-3) * per_node_df["cpu_time_s"] * 1000.0
+
+    # Save CSVs
+    summary_df.to_csv(f"summary_{profile}.csv", index=False)
+    per_node_df.to_csv(f"per_node_{profile}.csv", index=False)
+
+    return profile, net, summary_df, per_node_df, residuals
+
+
 # =============================================================================
 # CLI / Main
 # =============================================================================
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Ad-hoc time sync security overhead simulator")
+    parser = argparse.ArgumentParser(description="Ad-hoc time sync security overhead simulator with Suite profiles")
     # Topology / scale
     parser.add_argument("--nodes", type=int, default=100, help="number of nodes")
     parser.add_argument("--epochs", type=int, default=60, help="number of epochs")
@@ -485,52 +793,125 @@ def main() -> int:
     parser.add_argument("--loss", type=float, default=0.02, help="baseline packet loss probability")
     parser.add_argument("--seed", type=int, default=42, help="RNG seed")
 
+    # Optional global overrides for measured message overheads (bytes)
+    parser.add_argument("--msg-overhead-bcast", type=int, default=None,
+                        help="override: extra bytes added to every broadcast")
+    parser.add_argument("--msg-overhead-uni", type=int, default=None,
+                        help="override: extra bytes added to every unicast")
+
     # Plotting
     parser.add_argument("--show-ids", action="store_true", help="annotate node IDs on topology plot")
     parser.add_argument("--no-topology", action="store_true", help="skip topology plotting")
 
-    # Feature toggles (countermeasures)
-    parser.add_argument("--no-auth", action="store_true", help="disable authenticated messaging + replay protection")
-    parser.add_argument("--no-consistency", action="store_true", help="disable neighbor consistency & majority voting")
-    parser.add_argument("--no-rtt", action="store_true", help="disable RTT wormhole/delay checks")
-    parser.add_argument("--no-cad", action="store_true", help="disable CAD (beacon multiplier always 1)")
+    # Profiles
+    parser.add_argument("--profile", type=str, default="suite-a",
+                        choices=["suite-a", "suite-b", "suite-c", "suite-d", "suite-e"],
+                        help="which suite profile to run")
+    parser.add_argument("--compare-suites", action="store_true",
+                        help="run multiple suites on same topology and overlay comparison plots")
+    parser.add_argument("--suites", type=str,
+                        default="suite-a,suite-b,suite-c,suite-d",
+                        help="comma-separated suites to compare (e.g., suite-a,suite-b,...)")
 
     args = parser.parse_args()
 
-    # Build config with flags applied
-    cfg = SimConfig(
+    # Base config (shared across profiles); profiles clone and adjust this
+    base_cfg = SimConfig(
         n_nodes=args.nodes,
         epochs=args.epochs,
         radio_range=args.range,
         base_packet_loss=args.loss,
         seed=args.seed,
-        enable_auth=not args.no_auth,
-        enable_consistency=not args.no_consistency,
-        enable_rtt=not args.no_rtt,
-        enable_cad=not args.no_cad,
     )
 
-    # Build network + topology plot
-    net = Network(cfg)
-    if not args.no_topology:
-        plot_topology(net, annotate=args.show_ids, filename="topology.png")
+    def apply_global_overrides(cfg: SimConfig) -> SimConfig:
+        if args.msg_overhead_bcast is not None:
+            cfg.message_overhead_bcast_bytes = args.msg_overhead_bcast
+        if args.msg_overhead_uni is not None:
+            cfg.message_overhead_uni_bytes = args.msg_overhead_uni
+        return cfg
 
-    # Run simulation
-    summary_df, per_node_df, residuals = net.run()
+    if args.compare_suites:
+        labels = [s.strip().lower() for s in args.suites.split(",") if s.strip()]
+        all_node_tables: Dict[str, pd.DataFrame] = {}
+        all_residuals: Dict[str, List[float]] = {}
 
-    # Enhance per-node with extra derived metrics for plotting
-    per_node_df["energy_used_mJ"] = cfg.battery_mj - per_node_df["battery_remaining_mJ"]
-    per_node_df["cpu_energy_mJ"] = (cfg.mcu_power_mw * 1e-3) * per_node_df["cpu_time_s"] * 1000.0  # J->mJ
+        for idx, label in enumerate(labels):
+            suite_cfg = make_profile_cfg(base_cfg, label)
+            suite_cfg = apply_global_overrides(suite_cfg)
+            # Keep identical topology/seed across suites
+            np.random.seed(suite_cfg.seed); random.seed(suite_cfg.seed)
+            net = Network(suite_cfg)
+            if idx == 0 and not args.no_topology:
+                plot_topology(net, annotate=False, filename=f"topology_{label}.png")
+            summary_df, per_node_df, residuals = net.run()
 
-    # Save CSVs
-    summary_df.to_csv("summary.csv", index=False)
-    per_node_df.to_csv("per_node.csv", index=False)
+            # Derived metrics
+            per_node_df["energy_used_mJ"] = suite_cfg.battery_mj - per_node_df["battery_remaining_mJ"]
+            per_node_df["cpu_energy_mJ"] = (suite_cfg.mcu_power_mw * 1e-3) * per_node_df["cpu_time_s"] * 1000.0
+
+            # Save CSVs
+            summary_df.to_csv(f"summary_{label}.csv", index=False)
+            per_node_df.to_csv(f"per_node_{label}.csv", index=False)
+
+            print(f"\n=== {label.upper()} Summary ===")
+            print(summary_df.to_string(index=False))
+            all_node_tables[label] = per_node_df
+            all_residuals[label] = residuals
+
+        # Overlay plots — CONTINUOUS CURVES
+        overlay_compare_curves(
+            all_residuals,
+            "Convergence vs Epoch — Selected Suites",
+            "compare_convergence.png"
+        )
+
+        overlay_compare_degree_curves(
+            all_node_tables, "energy_used_mJ",
+            "Neighbors vs Total Energy Used — Selected Suites",
+            "Total Energy Used (mJ)",
+            "compare_degree_vs_energy.png"
+        )
+
+        overlay_compare_degree_curves(
+            all_node_tables, "cpu_time_s",
+            "Neighbors vs CPU Calculation Time — Selected Suites",
+            "CPU Time (s)",
+            "compare_degree_vs_cpu_time.png"
+        )
+
+        overlay_compare_degree_curves(
+            all_node_tables, "cpu_energy_mJ",
+            "Neighbors vs CPU Energy — Selected Suites",
+            "CPU Energy (mJ)",
+            "compare_degree_vs_cpu_energy.png"
+        )
+
+        # NEW: Overhead messages curve (beacons_overhead + RTT msgs)
+        overlay_compare_degree_curves(
+            all_node_tables, "overhead_msgs_sent",
+            "Neighbors vs Overhead Messages — Selected Suites",
+            "Overhead Messages (count)",
+            "compare_degree_vs_overhead_msgs.png"
+        )
+
+        return 0
+
+    # Single profile run
+    profile = args.profile
+    suite_cfg = make_profile_cfg(base_cfg, profile)
+    suite_cfg = apply_global_overrides(suite_cfg)
+    np.random.seed(suite_cfg.seed); random.seed(suite_cfg.seed)
+    prof, net, summary_df, per_node_df, residuals = run_profile(
+        suite_cfg, profile, show_topology=(not args.no_topology)
+    )
 
     # Console summary
-    print("\n=== Simulation Summary ===")
+    print(f"\n=== {prof.upper()} Summary ===")
     print(summary_df.to_string(index=False))
 
-    # Plot: per-node energy histogram
+    # Per-profile single-run plots
+    # 1) Per-node energy histogram
     plt.figure(figsize=(7, 4))
     plt.hist(per_node_df["energy_used_mJ"].values, bins=20)
     plt.title("Per-Node Energy Consumed (mJ)")
@@ -539,7 +920,7 @@ def main() -> int:
     plt.tight_layout()
     plt.show()
 
-    # Plot: convergence curve
+    # 2) Convergence curve
     plt.figure(figsize=(7, 4))
     plt.plot(range(len(residuals)), residuals)
     plt.title("Median Absolute Residual Offset vs Network Median")
@@ -548,43 +929,35 @@ def main() -> int:
     plt.tight_layout()
     plt.show()
 
-    # ---------------------------------------------------------------------
-    # NEW SCATTER PLOTS (degree vs energy/time/cpu-energy)
-    # ---------------------------------------------------------------------
-    deg = per_node_df["degree"].values
-    energy_used = per_node_df["energy_used_mJ"].values
-    cpu_time = per_node_df["cpu_time_s"].values
-    cpu_energy = per_node_df["cpu_energy_mJ"].values
+    # 3) Degree curves (continuous, saved)
+    plot_degree_curve(
+        per_node_df, "energy_used_mJ",
+        "Neighbors vs Total Energy Used",
+        "Total Energy Used (mJ)",
+        "degree_vs_energy_curve.png"
+    )
 
-    # (1) Degree vs total energy used (mJ)
-    plt.figure(figsize=(7, 4))
-    plt.scatter(deg, energy_used, s=28)
-    plt.title("Neighbors vs Total Energy Used")
-    plt.xlabel("Number of Neighbors (Degree)")
-    plt.ylabel("Total Energy Used (mJ)")
-    plt.tight_layout()
-    plt.savefig("degree_vs_energy.png", dpi=200)
-    plt.show()
+    plot_degree_curve(
+        per_node_df, "cpu_time_s",
+        "Neighbors vs CPU Calculation Time",
+        "CPU Time (s)",
+        "degree_vs_cpu_time_curve.png"
+    )
 
-    # (2) Degree vs CPU time (s)
-    plt.figure(figsize=(7, 4))
-    plt.scatter(deg, cpu_time, s=28)
-    plt.title("Neighbors vs CPU Calculation Time")
-    plt.xlabel("Number of Neighbors (Degree)")
-    plt.ylabel("CPU Time (s)")
-    plt.tight_layout()
-    plt.savefig("degree_vs_cpu_time.png", dpi=200)
-    plt.show()
+    plot_degree_curve(
+        per_node_df, "cpu_energy_mJ",
+        "Neighbors vs CPU Energy (Processing Power Used)",
+        "CPU Energy (mJ)",
+        "degree_vs_cpu_energy_curve.png"
+    )
 
-    # (3) Degree vs CPU energy (mJ)
-    plt.figure(figsize=(7, 4))
-    plt.scatter(deg, cpu_energy, s=28)
-    plt.title("Neighbors vs CPU Energy (Processing Power Used)")
-    plt.xlabel("Number of Neighbors (Degree)")
-    plt.ylabel("CPU Energy (mJ)")
-    plt.tight_layout()
-    plt.savefig("degree_vs_cpu_energy.png", dpi=200)
-    plt.show()
+    # 4) NEW: Overhead messages curve
+    plot_degree_curve(
+        per_node_df, "overhead_msgs_sent",
+        "Neighbors vs Overhead Messages",
+        "Overhead Messages (count)",
+        "degree_vs_overhead_msgs_curve.png"
+    )
 
     return 0
 
